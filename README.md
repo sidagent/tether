@@ -81,6 +81,28 @@ sudo tether revoke 'RULE'                    # end one lease now
 sudo tether revoke --all                     # end all leases now
 sudo tether prune                            # drop expired leases from the managed allow list
 ```
+### Directory leases: let Claude reach outside the working directory
+```sh
+sudo tether grant-dir ~/datasets 2h analysis run     # read+write access to that tree, expiring in 2h
+sudo tether grant-dir ~/reference 1h --read-only     # reads only
+sudo tether revoke-dir ~/datasets                    # end it now
+```
+Claude Code asks before reading or writing files outside the project's working directory. A directory lease
+grants that access for one directory tree, for a bounded time: `grant-dir DIR` emits `Read(//DIR/**)` and
+`Edit(//DIR/**)` leases (`Edit(path)` covers every file-writing tool), so while you're working in directory X,
+Claude can read and write directory Y, and anything outside Y still prompts.
+
+The directory is canonicalized at grant time (`~` expanded, symlinks resolved), and requests are matched
+against the `realpath()` of the target: a symlink inside Y that points outside Y does not get access, and a
+path with a `..` component never matches. Some directories can never be leased: `/`, your home directory,
+`~/.ssh`, `~/.claude`, anything inside them, any ancestor of them, and tether's own paths (leasing `~/.ssh`
+would hand the agent your private keys; an ancestor does the same through it). Granting the same directory
+again replaces its previous lease. After expiry or `revoke-dir`, access goes back to prompting.
+
+Directory leases cover the file tools (`Read`, `Edit`, `Write`, `MultiEdit`, `NotebookEdit`). Shell commands
+are not path-checked by tether: a `Bash` command that touches Y needs a `Bash` lease or your approval, as
+before.
+
 ### Policy: limit what can ever be leased (recommended)
 ```sh
 sudo tether policy ssh-only        # only rules like Bash(ssh HOST:*) can be granted or honoured
@@ -150,6 +172,7 @@ RULE uses Claude Code's permission-rule syntax:
 | `Bash(npm test)` | exactly `npm test` |
 | `Bash(/Users/me/proj/run_bench.sh:*)` | one script, any arguments |
 | `Edit(//Users/me/proj/**)` | edits under that absolute path (`//` = absolute) |
+| `sudo tether grant-dir /Users/me/data 2h` | reads + writes under that directory (see above) |
 | `WebFetch` | a whole tool |
 
 Compound Bash commands (`a && b`, `a | b`, `a; b`) are allowed automatically only if **every** part is covered
@@ -166,7 +189,10 @@ prompt, because the lease is also a managed allow rule and only a hook deny over
 the `-` check applies to every `PREFIX:*` lease, so `Bash(npm test:*)` will refuse `npm test --watch`.
 
 File leases (`Edit(//...)`, `Write(//...)`, `Read(//...)`) are matched against the `realpath()` of the target, so a
-symlink can't lead out of the leased tree, and a path with any `..` component is never auto-allowed.
+symlink can't lead out of the leased tree, and a path with any `..` component is never auto-allowed. In the
+hook, an `Edit(path)` lease also covers `Write`/`MultiEdit`/`NotebookEdit` calls (Claude Code's own rule
+semantics), so those get lease attribution, and an expired Edit lease sends them back to prompting instead of
+silently riding the stale managed allow rule.
 
 ### Examples
 ```sh
@@ -180,6 +206,9 @@ sudo tether grant 'Bash(ssh gpubox:*)' 8h
 # Allow edits only inside one repo for a working session
 sudo tether grant 'Edit(//Users/me/work/api/**)' 3h
 sudo tether grant 'Write(//Users/me/work/api/**)' 3h
+
+# Let an agent working in ~/work read and write ~/datasets for two hours
+sudo tether grant-dir ~/datasets 2h analysis run
 ```
 
 ### Audit and revert
@@ -228,6 +257,11 @@ ssh nexus ls *.py                                    # denied: unquoted glob (us
   launches another agent, sandbox that agent separately (for example with `sandbox-exec`).
 - **Leases are prefix rules.** `Bash(ssh host:*)` means *anything* on that host as your user, so keep them
   narrow and short.
+- **Directory leases cover file tools, not shell commands.** `grant-dir` governs `Read`/`Edit`/`Write`/
+  `MultiEdit`/`NotebookEdit` on that tree. A `Bash` command like `cat ~/leased/file` or `cp x ~/leased/` isn't
+  path-checked by tether and follows the normal Bash permission flow. A leased directory can also *contain*
+  sensitive files you didn't think of (a stray `.env`, a project's `.claude/settings.json` stays Edit-denied
+  but becomes readable), so lease narrow directories.
 - **Redaction is best effort.** Only the patterns above are caught: an AWS *secret* key, a password in a config
   file, or a token in an unusual format printed by a Bash command will be logged. Tool *inputs* (commands, and
   `Write`/`Edit` content) are logged as-is, so a command that contains a token puts it in the log.
@@ -267,7 +301,8 @@ sudo tether uninstall     # restores the previous managed settings; the log is k
 ## Development
 `TETHER_PREFIX=/some/tmp` redirects every system path, so everything runs unprivileged.
 `tests/smoke.sh` covers allow, deny, compound commands, the word boundary, expiry, unsafe redirect/option forms,
-`..`/symlink file paths, secret snapshots and redaction, the log mode, lock-hooks, the writable-script check,
+`..`/symlink file paths, directory leases (boundaries, read-only mode, refusals, replacement, revoke and expiry),
+secret snapshots and redaction, the log mode, lock-hooks, the writable-script check,
 control characters in `tether log`, the installer message, revert and the managed-settings contents. It prints
 only `ok` lines when everything passes.
 

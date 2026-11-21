@@ -8,6 +8,8 @@ Claude runs as the user without the sudo password, so it can read but not alter 
 
   sudo tether install                         install hooks + managed settings (review the repo first)
   sudo tether grant 'Bash(ssh nexus:*)' 10h   lease a permission rule for a duration
+  sudo tether grant-dir DIR 10h [note] [--read-only]   lease read (default: read+write) access to a directory
+  sudo tether revoke-dir DIR                  end the directory lease(s) for DIR now
   sudo tether revoke ['RULE' | --all]         end lease(s) now
   sudo tether policy ssh-only|any|REGEX      restrict which rules can ever be leased (tether policy = show)
   sudo tether prune                           drop expired leases from managed allow list (hook asks for them anyway)
@@ -371,6 +373,16 @@ def rule_matches(rule, tool, tool_input, sub=None):
     m = RULE_RE.match(rule.strip())
     return bool(m) and m.group(1) == tool and spec_matches(tool, m.group(2), tool_input, sub)
 
+def lease_rule_matches(rule, tool, tool_input, sub=None):
+    """rule_matches, plus Claude Code's own rule semantics: an Edit(path) rule covers every file-writing
+    tool (Write, MultiEdit, NotebookEdit; Claude Code warns a Write(path) rule never matches). Without this,
+    a Write call under an expired Edit lease would fall through to the stale managed allow rule until
+    `tether prune` ran, instead of going back to prompting."""
+    if rule_matches(rule, tool, tool_input, sub):
+        return True
+    m = RULE_RE.match(rule.strip())
+    return bool(m) and m.group(1) == "Edit" and tool in FILE_TOOLS and spec_matches(tool, m.group(2), tool_input)
+
 def expired_ask(l):
     return "ask", "tether: lease %s expired at %s — asking instead of auto-allowing" % (l["rule"], l["expires"]), l["rule"]
 
@@ -441,10 +453,10 @@ def decide(tool, tool_input, leases, t=None):
                 return None, "", None
             cover.append(hit["rule"])
         return "allow", "tether lease: " + ", ".join(sorted(set(cover))), cover[0]
-    hit = next((l for l in act if rule_matches(l["rule"], tool, tool_input)), None)
+    hit = next((l for l in act if lease_rule_matches(l["rule"], tool, tool_input)), None)
     if hit:
         return "allow", "tether lease: " + hit["rule"], hit["rule"]
-    gone = next((l for l in exp if rule_matches(l["rule"], tool, tool_input)), None)
+    gone = next((l for l in exp if lease_rule_matches(l["rule"], tool, tool_input)), None)
     if gone:
         return expired_ask(gone)
     return None, "", None
@@ -629,6 +641,93 @@ def cmd_grant(rule, dur, note, force=False):
     regen()
     append_log({"phase": "admin", "action": "grant", "rule": rule, "expires": leases[-1]["expires"], "note": note})
     print("granted %s until %s" % (rule, leases[-1]["expires"]))
+
+# ---------------- directory leases ----------------
+def canon_dir(p):
+    """Canonical absolute path for a directory lease, or exit. The lease stores this resolved form, so a
+    symlinked or '~' argument can't mean something different at check time than it did at grant time."""
+    p = os.path.expanduser(p)
+    if not os.path.isabs(p):
+        sys.exit("give an absolute path (or ~/...): %r" % p)
+    canon = os.path.realpath(p)
+    if re.search(r"[()*?[\]\n]", canon):
+        sys.exit("refused: path %r contains a character that would break the permission-rule syntax" % canon)
+    return canon
+
+def dir_off_limits(canon):
+    """Why this directory can never be leased, or None. A dir lease emits Read/Edit allow rules, and managed
+    deny rules don't cover reads outside tether's own key dir: leasing ~/.ssh would hand the agent your
+    private keys, and leasing an ancestor (your home, /Users, /) does the same through it."""
+    if canon == "/":
+        return "leasing / is the whole machine"
+    home = os.path.realpath(user_home())
+    prot = [LIB, ETC, LOGDIR, os.path.join(home, ".ssh"), os.path.join(home, ".claude")]
+    for q in prot:
+        q = os.path.realpath(q)
+        if canon == q or canon.startswith(q + os.sep):
+            return "%s is inside protected %s" % (canon, q)
+        if q.startswith(canon + os.sep):
+            return "%s contains protected %s (lease a sibling directory instead)" % (canon, q)
+    if is_secret_path(canon + os.sep):
+        return "%s matches a secret path pattern" % canon
+    return None
+
+def dir_rules(canon, read_only):
+    """Read(dir/**) covers the file reads; Edit(dir/**) covers every file-writing tool (Edit, Write,
+    MultiEdit, NotebookEdit) under Claude Code's rule semantics."""
+    rules = ["Read(/%s/**)" % canon]
+    if not read_only:
+        rules.append("Edit(/%s/**)" % canon)
+    return rules
+
+def cmd_grant_dir(path, dur, note, read_only=False):
+    need_root()
+    canon = canon_dir(path)
+    if not os.path.isdir(canon):
+        sys.exit("not a directory: %s" % canon)
+    bad = dir_off_limits(canon)
+    if bad:
+        sys.exit("refused: %s" % bad)
+    rules = dir_rules(canon, read_only)
+    pol = load_policy()
+    for r in rules:
+        if not policy_ok(r, pol):
+            sys.exit("refused: rule %s does not match policy allow_rule_regex %r (see: tether policy)"
+                     % (r, pol.get("allow_rule_regex")))
+    leases = load_leases()
+    ssh_cleanup(leases)
+    t = now(); exp = iso(t + parse_dur(dur)); by = os.environ.get("SUDO_USER", "?")
+    for l in leases:                       # re-granting a directory replaces its previous lease
+        if l["rule"] in rules and lease_active(l):
+            l["expires"] = iso(t)
+    access = "read" if read_only else "write"
+    for r in rules:
+        leases.append({"rule": r, "granted": iso(t), "expires": exp, "note": note, "by": by,
+                       "dir": canon, "access": access})
+    write_root(LEASES, json.dumps(leases, indent=1))
+    regen()
+    append_log({"phase": "admin", "action": "grant-dir", "dir": canon, "access": access,
+                "rules": rules, "expires": exp, "note": note})
+    print("granted %s access to %s until %s" % ("read-only" if read_only else "read+write", canon, exp))
+    if path != canon:
+        print("(canonicalized %r -> %r)" % (path, canon))
+
+def cmd_revoke_dir(path):
+    need_root()
+    canon = canon_dir(path)
+    rules = set(dir_rules(canon, False))
+    leases, t = load_leases(), iso(now())
+    n = 0
+    for l in leases:
+        if lease_active(l) and (l.get("dir") == canon or l["rule"] in rules):
+            l["expires"] = t; n += 1
+    if not n:
+        sys.exit("no active directory lease for %s" % canon)
+    ssh_cleanup(leases)
+    write_root(LEASES, json.dumps(leases, indent=1))
+    regen()
+    append_log({"phase": "admin", "action": "revoke-dir", "dir": canon, "count": n})
+    print("revoked %d lease(s) on %s" % (n, canon))
 
 def cmd_revoke(rule):
     need_root()
@@ -1186,6 +1285,17 @@ def main(a):
         regen()
         append_log({"phase": "admin", "action": "policy", "allow_rule_regex": rx})
         print("policy allow_rule_regex =", rx)
+    elif c in ("grant-dir", "revoke-dir"):
+        import argparse
+        p = argparse.ArgumentParser(prog="tether " + c)
+        p.add_argument("dir")
+        if c == "grant-dir":
+            p.add_argument("duration"); p.add_argument("note", nargs="*")
+            p.add_argument("--read-only", action="store_true")
+            o = p.parse_args(a[1:])
+            cmd_grant_dir(o.dir, o.duration, " ".join(o.note), o.read_only)
+        else:
+            cmd_revoke_dir(p.parse_args(a[1:]).dir)
     elif c == "revoke":
         cmd_revoke(None if len(a) < 2 or a[1] == "--all" else a[1])
     elif c == "prune":

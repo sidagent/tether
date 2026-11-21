@@ -5,6 +5,7 @@ here=$(cd "$(dirname "$0")/.." && pwd)
 S=$(mktemp -d); export TETHER_PREFIX=$S; cd "$S"
 T() { /usr/bin/python3 "$here/tether.py" "$@"; }
 fail=0; check() { if [ "$2" = "$3" ]; then echo "ok   $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi; }
+if [ "$(uname)" = Darwin ]; then modeof() { stat -f %Lp "$1"; }; else modeof() { stat -c %a "$1"; }; fi
 # ev TOOL KEY VALUE [PHASE]: build a hook event with proper JSON quoting
 ev() { /usr/bin/python3 -c 'import sys,json; print(json.dumps({"tool_name":sys.argv[1],"tool_input":{sys.argv[2]:sys.argv[3]},"tool_use_id":"t"}))' "$1" "$2" "$3"; }
 pd() { /usr/bin/python3 -c 'import sys,json; s=sys.stdin.read().strip(); print(json.loads(s)["hookSpecificOutput"]["permissionDecision"] if s else "none")'; }
@@ -106,6 +107,52 @@ check "file lease allows inside"          "$(fdec Edit "$S/proj/a.txt")"        
 check "file lease: .. -> no-op"           "$(fdec Edit "$S/proj/../f.txt")"                          none
 check "file lease: .. resolving inside -> no-op" "$(fdec Edit "$S/proj/link/../a.txt")"              none
 check "file lease: symlink escape -> no-op" "$(fdec Edit "$S/proj/link/x.txt")"                      none
+# 2b. directory leases: grant-dir / revoke-dir (read+write by default, --read-only for reads)
+RS=$(cd "$S" && pwd -P)   # canonical sandbox path: grant-dir realpaths, and /tmp may be a symlink
+mkdir -p "$RS/data/sub" "$RS/data2" "$RS/ro" "$RS/home/.ssh"; echo d > "$RS/data/file.txt"; echo d2 > "$RS/data2/file.txt"
+T grant-dir "$RS/data" 1h project data >/dev/null
+check "dir lease: Read inside -> allow"          "$(fdec Read "$RS/data/file.txt")"   allow
+check "dir lease: Edit inside -> allow"          "$(fdec Edit "$RS/data/file.txt")"   allow
+check "dir lease: Write covered by Edit rule"    "$(fdec Write "$RS/data/new.txt")"   allow
+check "dir lease: MultiEdit covered"             "$(fdec MultiEdit "$RS/data/file.txt")" allow
+check "dir lease: NotebookEdit covered"          "$(ev NotebookEdit notebook_path "$RS/data/nb.ipynb" | T hook pre | pd)" allow
+check "dir lease: subdir covered"                "$(fdec Edit "$RS/data/sub/x.txt")"  allow
+check "dir lease: sibling prefix not covered"    "$(fdec Edit "$RS/data2/file.txt")"  none
+check "dir lease: parent dir not covered"        "$(fdec Edit "$RS/f.txt")"           none
+check "dir lease: .. component -> no-op"         "$(fdec Edit "$RS/x/../data/file.txt")" none
+ln -s "$RS/outside" "$RS/data/escape"
+check "dir lease: symlink escape -> no-op"       "$(fdec Edit "$RS/data/escape/x.txt")" none
+check "dir lease rules in managed allow" "$(/usr/bin/python3 -c 'import json,sys;a=json.load(open(sys.argv[1]))["permissions"]["allow"];print(("Read(/%s/data/**)"%sys.argv[2] in a) and ("Edit(/%s/data/**)"%sys.argv[2] in a))' "$M" "$RS")" True
+T grant-dir "$RS/ro" 1h --read-only >/dev/null
+check "read-only dir lease: Read -> allow"       "$(fdec Read "$RS/ro/f.txt")"        allow
+check "read-only dir lease: Edit not covered"    "$(fdec Edit "$RS/ro/f.txt")"        none
+check "read-only dir lease: Write not covered"   "$(fdec Write "$RS/ro/f.txt")"       none
+check "read-only lease: no Edit rule in managed allow" "$(grep -cF "Edit(/$RS/ro/" "$M")" 0
+check "grant-dir / refused"                      "$(T grant-dir / 1h 2>&1 | grep -c refused)" 1
+check "grant-dir home refused"                   "$(HOME="$RS/home" T grant-dir "$RS/home" 1h 2>&1 | grep -c refused)" 1
+check "grant-dir ~/.ssh refused"                 "$(HOME="$RS/home" T grant-dir "$RS/home/.ssh" 1h 2>&1 | grep -c refused)" 1
+check "grant-dir ancestor of tether dir refused" "$(T grant-dir "$RS/Library" 1h 2>&1 | grep -c refused)" 1
+check "grant-dir nonexistent refused"            "$(T grant-dir "$RS/nope" 1h 2>&1 | grep -c 'not a directory')" 1
+check "grant-dir relative path refused"          "$(T grant-dir reldir 1h 2>&1 | grep -c 'absolute')" 1
+T grant-dir "$RS/data" 2h re-granted >/dev/null
+check "re-grant replaces previous dir lease" "$(/usr/bin/python3 -c 'import json,sys,datetime as d;l=json.load(open(sys.argv[1]));now=d.datetime.now(d.timezone.utc);print(sum(1 for x in l if x.get("dir")==sys.argv[2] and d.datetime.fromisoformat(x["expires"]).astimezone()>now))' "$S/Library/Application Support/tether/leases.json" "$RS/data")" 2
+T revoke-dir "$RS/data" >/dev/null
+check "revoked dir lease: Edit -> ask"           "$(fdec Edit "$RS/data/file.txt")"   ask
+check "revoked dir lease: Write -> ask"          "$(fdec Write "$RS/data/file.txt")"  ask
+check "revoked dir lease: Read -> ask"           "$(fdec Read "$RS/data/file.txt")"   ask
+check "revoke-dir with no lease errors"          "$(T revoke-dir "$RS/data2" 2>&1 | grep -c 'no active directory lease')" 1
+T grant-dir "$RS/data" 1h >/dev/null
+/usr/bin/python3 - "$S/Library/Application Support/tether/leases.json" "$RS/data" <<'EOF'
+import json,sys
+p=sys.argv[1]; l=json.load(open(p))
+for x in l:
+    if x.get("dir")==sys.argv[2]: x["expires"]="2020-01-01T00:00:00+00:00"
+json.dump(l,open(p,"w"))
+EOF
+check "expired dir lease: Edit -> ask"           "$(fdec Edit "$RS/data/file.txt")"   ask
+check "expired dir lease: Write -> ask (Edit rule covers write tools)" "$(fdec Write "$RS/data/file.txt")" ask
+check "expired dir lease: Read -> ask"           "$(fdec Read "$RS/data/file.txt")"   ask
+check "expired dir lease: outside unaffected"    "$(fdec Edit "$RS/data2/file.txt")"  none
 # 3a. secret paths not snapshotted
 mkdir -p "$S/home/.ssh"; echo SECRETKEY > "$S/home/.ssh/config"; echo K=1 > "$S/.env"
 ev Edit file_path "$S/home/.ssh/config" | T hook pre >/dev/null
@@ -123,7 +170,7 @@ check "redaction marker present" "$(lastlog | grep -o 'REDACTED' | wc -l | tr -d
 post Bash "$(/usr/bin/python3 -c 'print("z"*5000)')"
 check "response capped at 2000" "$(lastlog | /usr/bin/python3 -c 'import sys,json;r=json.loads(sys.stdin.read())["response"];print(r.count("z"), "truncated" in r)')" "2000 True"
 # 3c. first-install log mode
-check "log created mode 660" "$(stat -f %Lp "$S/Library/Logs/tether/tether.log")" 660
+check "log created mode 660" "$(modeof "$S/Library/Logs/tether/tether.log")" 660
 # 4. lock-hooks / unlock-hooks + managed deny rules
 check "managed denies .claude + .git/hooks edits" "$(/usr/bin/python3 -c 'import json,sys;d=json.load(open(sys.argv[1]))["permissions"]["deny"];print(all(r in d for r in ["Edit(**/.claude/**)","Edit(**/.git/hooks/**)","Edit(~/.zshrc)","Edit(~/.ssh/**)"]) and not any(r.startswith("Write(") for r in d))' "$M")" True
 mkdir -p "$S/home/.claude"
@@ -186,13 +233,13 @@ check "remote keeps foreign key"     "$(grep -c 'AAAAkeep' "$AK")" 1
 check "remote drops expired tether"  "$(grep -c 'AAAAold' "$AK")" 0
 line=$(grep 'tether:' "$AK")
 check "remote line options" "$(printf '%s' "$line" | grep -cE '^restrict,pty,port-forwarding,permitopen="127.0.0.1:8080",permitopen="127.0.0.1:11434",permitlisten="127.0.0.1:1",expiry-time="[0-9]{12}Z",from="100.101.102.103" ssh-ed25519 AAAA[^ ]+ tether:[0-9a-f]{12}$')" 1
-check "remote authorized_keys 600"   "$(stat -f %Lp "$AK")" 600
+check "remote authorized_keys 600"   "$(modeof "$AK")" 600
 check "expiry-time is lease expiry in UTC" "$(/usr/bin/python3 -c '
 import json,sys,re,datetime as d
 l=[x for x in json.load(open(sys.argv[1])) if x.get("ssh")][-1]; e=re.search(r"expiry-time=\"(\d{12})Z",open(sys.argv[2]).read()).group(1)
 print(d.datetime.fromisoformat(l["expires"]).astimezone(d.timezone.utc).strftime("%Y%m%d%H%M")==e)' "$S/Library/Application Support/tether/leases.json" "$AK")" True
-check "private key 600"  "$(stat -f %Lp "$K/nexus-claude")" 600
-check "public key 644"   "$(stat -f %Lp "$K/nexus-claude.pub")" 644
+check "private key 600"  "$(modeof "$K/nexus-claude")" 600
+check "public key 644"   "$(modeof "$K/nexus-claude.pub")" 644
 check "key comment is tether:<lease-id>" "$(grep -c "$(cut -d' ' -f3 "$K/nexus-claude.pub")\$" "$AK")" 1
 cfg=$(cat "$K/config")
 check "client config block" "$(printf '%s' "$cfg" | grep -cE '^Host nexus-claude$|^  HostName 100.64.0.9$|^  User sid$|^  IdentityFile "'"$K"'/nexus-claude"$|^  IdentitiesOnly yes$|^  IdentityAgent none$|^  ExitOnForwardFailure yes$|^  ServerAliveInterval 30$')" 8
