@@ -8,7 +8,8 @@ Claude runs as the user without the sudo password, so it can read but not alter 
 
   sudo tether install                         install hooks + managed settings (review the repo first)
   sudo tether grant 'Bash(ssh nexus:*)' 10h   lease a permission rule for a duration
-  sudo tether grant-dir DIR 10h [note] [--read-only]   lease read (default: read+write) access to a directory
+  sudo tether grant-dir DIR 10h [note] [--read-only]   give DIR working-directory powers for a while
+                                                       (default read+write+search; --read-only: reads+searches)
   sudo tether revoke-dir DIR                  end the directory lease(s) for DIR now
   sudo tether revoke ['RULE' | --all]         end lease(s) now
   sudo tether policy ssh-only|any|REGEX      restrict which rules can ever be leased (tether policy = show)
@@ -37,6 +38,9 @@ BIN = PREFIX + "/usr/local/bin/tether"
 PY = "/usr/bin/python3"
 MAX_BLOB = 5 * 1024 * 1024
 FILE_TOOLS = {"Write": "file_path", "Edit": "file_path", "MultiEdit": "file_path", "NotebookEdit": "notebook_path"}
+# Read(path) rules cover the search/list tools too (Claude Code applies Read rules to them; a Grep(path) or
+# Glob(path) rule never matches). Grep and Glob default to the session cwd when no path is given.
+SEARCH_TOOLS = {"Grep", "Glob", "LS"}
 MAX_RESPONSE = 2000
 # Never snapshot these into the log (it is readable by group staff).
 SECRET_SUBSTR = ("/.ssh/", "/Library/Keychains/", "/.aws/", "/.gnupg/", "/.config/gh/",
@@ -353,7 +357,7 @@ def norm_pattern(pat):
     head = pat[:pat.rfind("/", 0, g)]
     return (os.path.realpath(head) + pat[len(head):]) if head else pat
 
-def spec_matches(tool, spec, tool_input, sub=None):
+def spec_matches(tool, spec, tool_input, sub=None, cwd=None):
     if spec is None or spec in ("", "*"):
         return True
     if tool == "Bash":
@@ -363,25 +367,36 @@ def spec_matches(tool, spec, tool_input, sub=None):
             return c == p or c.startswith(p + " ")
         return c == spec
     path = tool_input.get(FILE_TOOLS.get(tool, "file_path")) or tool_input.get("path") or ""
+    if not path and tool in SEARCH_TOOLS and cwd:
+        path = cwd                        # Grep/Glob without a path search the session cwd
     if not path or ".." in re.split(r"[/\\]", path):
         return False                          # never lease-match a path with a .. component
     path = os.path.realpath(os.path.expanduser(path))
     pat = spec[1:] if spec.startswith("//") else os.path.expanduser(spec)
-    return fnmatch.fnmatch(path, norm_pattern(pat))
+    n = norm_pattern(pat)
+    # The /.' probe also matches the leased directory root itself against its own dir/** pattern.
+    return fnmatch.fnmatch(path, n) or fnmatch.fnmatch(path + os.sep + ".", n)
 
-def rule_matches(rule, tool, tool_input, sub=None):
+def rule_matches(rule, tool, tool_input, sub=None, cwd=None):
     m = RULE_RE.match(rule.strip())
-    return bool(m) and m.group(1) == tool and spec_matches(tool, m.group(2), tool_input, sub)
+    return bool(m) and m.group(1) == tool and spec_matches(tool, m.group(2), tool_input, sub, cwd)
 
-def lease_rule_matches(rule, tool, tool_input, sub=None):
-    """rule_matches, plus Claude Code's own rule semantics: an Edit(path) rule covers every file-writing
-    tool (Write, MultiEdit, NotebookEdit; Claude Code warns a Write(path) rule never matches). Without this,
-    a Write call under an expired Edit lease would fall through to the stale managed allow rule until
-    `tether prune` ran, instead of going back to prompting."""
-    if rule_matches(rule, tool, tool_input, sub):
+def lease_rule_matches(rule, tool, tool_input, sub=None, cwd=None):
+    """rule_matches, plus Claude Code's own rule semantics, mirrored so leases cover what the native rules
+    would cover: an Edit(path) rule covers every file-writing tool (Write, MultiEdit, NotebookEdit; Claude
+    Code warns a Write(path) rule never matches), and a Read(path) rule covers the search/list tools
+    (Grep, Glob, LS; Grep(path)/Glob(path) rules never match). Without this, a Write or Grep call under an
+    expired lease would fall through to the stale managed allow rule (or a stale additionalDirectories
+    entry) until `tether prune` ran, instead of going back to prompting."""
+    if rule_matches(rule, tool, tool_input, sub, cwd):
         return True
     m = RULE_RE.match(rule.strip())
-    return bool(m) and m.group(1) == "Edit" and tool in FILE_TOOLS and spec_matches(tool, m.group(2), tool_input)
+    if not m:
+        return False
+    if m.group(1) == "Edit" and tool in FILE_TOOLS:
+        return spec_matches(tool, m.group(2), tool_input, cwd=cwd)
+    return bool(m.group(1) == "Read" and tool in SEARCH_TOOLS
+                and spec_matches(tool, m.group(2), tool_input, cwd=cwd))
 
 def expired_ask(l):
     return "ask", "tether: lease %s expired at %s — asking instead of auto-allowing" % (l["rule"], l["expires"]), l["rule"]
@@ -416,7 +431,7 @@ def strict_shape(rule, sub):
             return "first argument after the prefix may not start with '-' or '=' (ssh option / zsh =cmd expansion)"
     return None
 
-def decide(tool, tool_input, leases, t=None):
+def decide(tool, tool_input, leases, t=None, cwd=None):
     """-> (decision or None, reason, lease_rule)"""
     pol = load_policy()
     act = [l for l in leases if lease_active(l, t) and policy_ok(l["rule"], pol)]
@@ -453,10 +468,10 @@ def decide(tool, tool_input, leases, t=None):
                 return None, "", None
             cover.append(hit["rule"])
         return "allow", "tether lease: " + ", ".join(sorted(set(cover))), cover[0]
-    hit = next((l for l in act if lease_rule_matches(l["rule"], tool, tool_input)), None)
+    hit = next((l for l in act if lease_rule_matches(l["rule"], tool, tool_input, cwd=cwd)), None)
     if hit:
         return "allow", "tether lease: " + hit["rule"], hit["rule"]
-    gone = next((l for l in exp if lease_rule_matches(l["rule"], tool, tool_input)), None)
+    gone = next((l for l in exp if lease_rule_matches(l["rule"], tool, tool_input, cwd=cwd)), None)
     if gone:
         return expired_ask(gone)
     return None, "", None
@@ -488,7 +503,7 @@ def hook(phase):
                 e["existed"] = True
             else:
                 e["existed"] = False
-        d, why, rule = decide(tool, ti, load_leases())
+        d, why, rule = decide(tool, ti, load_leases(), cwd=ev.get("cwd"))
         if d:
             e["decision"], e["lease"] = d, rule
             out = {"hookSpecificOutput": {"hookEventName": "PreToolUse",
@@ -555,6 +570,21 @@ def managed_doc(leases, drop_hooks=None):
     allow = [r for r in perms.get("allow", []) if r not in {l["rule"] for l in leases}]
     pol = load_policy()
     perms["allow"] = allow + sorted({l["rule"] for l in leases if lease_active(l) and policy_ok(l["rule"], pol)})
+    # A read+write directory lease also lists the tree under permissions.additionalDirectories (the
+    # settings form of `/add-dir`), giving it true working-directory standing: reads/searches need no
+    # approval, `cd` into it is read-only, acceptEdits covers it, and redirects into it pass the file
+    # checks. --read-only leases stay out: additionalDirectories would add write-side behavior too.
+    # Expired entries drop out here; the hook still forces a prompt for file/search tools on its own.
+    tether_dirs = {l["dir"] for l in leases if l.get("dir")}
+    live_dirs = {l["dir"] for l in leases
+                 if l.get("dir") and lease_active(l) and l.get("access", "write") == "write"
+                 and policy_ok(l["rule"], pol)}
+    extra_dirs = [d for d in perms.get("additionalDirectories", []) if d not in tether_dirs]
+    both = sorted(set(extra_dirs) | live_dirs)
+    if both:
+        perms["additionalDirectories"] = both
+    else:
+        perms.pop("additionalDirectories", None)
     # Edit(path) rules cover every file-writing tool (Edit, Write, NotebookEdit); Claude Code warns that
     # Write(path) rules never match, so only Edit/Read path rules are emitted.
     lock = ["Edit(/%s/**)" % LIB, "Edit(/%s/**)" % ETC, "Edit(/%s)" % MANAGED, "Read(/%s/ssh/**)" % ETC,
@@ -709,6 +739,8 @@ def cmd_grant_dir(path, dur, note, read_only=False):
     append_log({"phase": "admin", "action": "grant-dir", "dir": canon, "access": access,
                 "rules": rules, "expires": exp, "note": note})
     print("granted %s access to %s until %s" % ("read-only" if read_only else "read+write", canon, exp))
+    if not read_only:
+        print("(%s is an additionalDirectory while the lease is active: same standing as your working directory)" % canon)
     if path != canon:
         print("(canonicalized %r -> %r)" % (path, canon))
 

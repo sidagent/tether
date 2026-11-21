@@ -8,6 +8,8 @@ fail=0; check() { if [ "$2" = "$3" ]; then echo "ok   $1"; else echo "FAIL $1: g
 if [ "$(uname)" = Darwin ]; then modeof() { stat -f %Lp "$1"; }; else modeof() { stat -c %a "$1"; }; fi
 # ev TOOL KEY VALUE [PHASE]: build a hook event with proper JSON quoting
 ev() { /usr/bin/python3 -c 'import sys,json; print(json.dumps({"tool_name":sys.argv[1],"tool_input":{sys.argv[2]:sys.argv[3]},"tool_use_id":"t"}))' "$1" "$2" "$3"; }
+# evc TOOL INPUT_JSON CWD: hook event with a cwd field (Grep/Glob without a path search the cwd)
+evc() { /usr/bin/python3 -c 'import sys,json; print(json.dumps({"tool_name":sys.argv[1],"tool_input":json.loads(sys.argv[2]),"cwd":sys.argv[3],"tool_use_id":"t"}))' "$1" "$2" "$3"; }
 pd() { /usr/bin/python3 -c 'import sys,json; s=sys.stdin.read().strip(); print(json.loads(s)["hookSpecificOutput"]["permissionDecision"] if s else "none")'; }
 dec()  { ev Bash command "$1" | T hook pre | pd; }
 fdec() { ev "$1" file_path "$2" | T hook pre | pd; }
@@ -122,12 +124,38 @@ check "dir lease: parent dir not covered"        "$(fdec Edit "$RS/f.txt")"     
 check "dir lease: .. component -> no-op"         "$(fdec Edit "$RS/x/../data/file.txt")" none
 ln -s "$RS/outside" "$RS/data/escape"
 check "dir lease: symlink escape -> no-op"       "$(fdec Edit "$RS/data/escape/x.txt")" none
+# 2c. directory leases: search tools (Read lease covers Grep/Glob/LS) + additionalDirectories parity
+check "dir lease: Grep path inside -> allow"     "$(ev Grep path "$RS/data/sub" | T hook pre | pd)" allow
+check "dir lease: Glob path inside -> allow"     "$(ev Glob path "$RS/data/sub" | T hook pre | pd)" allow
+check "dir lease: LS path inside -> allow"       "$(ev LS path "$RS/data/sub" | T hook pre | pd)"   allow
+check "dir lease: Grep on dir root -> allow"     "$(ev Grep path "$RS/data" | T hook pre | pd)"     allow
+check "dir lease: Grep sibling -> no-op"         "$(ev Grep path "$RS/data2" | T hook pre | pd)"    none
+check "dir lease: Grep parent -> no-op"          "$(ev Grep path "$RS" | T hook pre | pd)"          none
+check "dir lease: Grep symlink escape -> no-op"  "$(ev Grep path "$RS/data/escape" | T hook pre | pd)" none
+check "dir lease: Grep no path, cwd inside -> allow" "$(evc Grep '{}' "$RS/data/sub" | T hook pre | pd)" allow
+check "dir lease: Grep no path, cwd outside -> no-op" "$(evc Grep '{}' "$RS/data2" | T hook pre | pd)"  none
+check "dir lease in managed additionalDirectories" "$(/usr/bin/python3 -c 'import json,sys;print(sys.argv[2] in json.load(open(sys.argv[1]))["permissions"].get("additionalDirectories",[]))' "$M" "$RS/data")" True
 check "dir lease rules in managed allow" "$(/usr/bin/python3 -c 'import json,sys;a=json.load(open(sys.argv[1]))["permissions"]["allow"];print(("Read(/%s/data/**)"%sys.argv[2] in a) and ("Edit(/%s/data/**)"%sys.argv[2] in a))' "$M" "$RS")" True
 T grant-dir "$RS/ro" 1h --read-only >/dev/null
 check "read-only dir lease: Read -> allow"       "$(fdec Read "$RS/ro/f.txt")"        allow
 check "read-only dir lease: Edit not covered"    "$(fdec Edit "$RS/ro/f.txt")"        none
 check "read-only dir lease: Write not covered"   "$(fdec Write "$RS/ro/f.txt")"       none
 check "read-only lease: no Edit rule in managed allow" "$(grep -cF "Edit(/$RS/ro/" "$M")" 0
+check "read-only dir lease: Grep -> allow"       "$(ev Grep path "$RS/ro" | T hook pre | pd)"      allow
+check "read-only dir lease: Glob -> allow"       "$(ev Glob path "$RS/ro" | T hook pre | pd)"      allow
+check "read-only lease NOT an additionalDirectory (would grant write-side parity)" "$(/usr/bin/python3 -c 'import json,sys;print(sys.argv[2] not in json.load(open(sys.argv[1]))["permissions"].get("additionalDirectories",[]))' "$M" "$RS/ro")" True
+# additionalDirectories: pre-existing (admin) entries survive regeneration; revoked leases drop out
+/usr/bin/python3 - "$M" <<'EOF'
+import json,sys
+p=sys.argv[1]; d=json.load(open(p))
+d["permissions"]["additionalDirectories"]=["/opt/admin-dir"]
+json.dump(d,open(p,"w"))
+EOF
+mkdir -p "$RS/data3"
+T grant-dir "$RS/data3" 1h >/dev/null
+check "additionalDirectories: admin entry kept, lease added" "$(/usr/bin/python3 -c 'import json,sys;a=json.load(open(sys.argv[1]))["permissions"]["additionalDirectories"];print("/opt/admin-dir" in a and sys.argv[2] in a and sys.argv[3] in a)' "$M" "$RS/data" "$RS/data3")" True
+T revoke-dir "$RS/data3" >/dev/null
+check "revoke-dir drops additionalDirectories entry" "$(/usr/bin/python3 -c 'import json,sys;a=json.load(open(sys.argv[1]))["permissions"]["additionalDirectories"];print("/opt/admin-dir" in a and sys.argv[2] not in a)' "$M" "$RS/data3")" True
 check "grant-dir / refused"                      "$(T grant-dir / 1h 2>&1 | grep -c refused)" 1
 check "grant-dir home refused"                   "$(HOME="$RS/home" T grant-dir "$RS/home" 1h 2>&1 | grep -c refused)" 1
 check "grant-dir ~/.ssh refused"                 "$(HOME="$RS/home" T grant-dir "$RS/home/.ssh" 1h 2>&1 | grep -c refused)" 1
@@ -152,7 +180,12 @@ EOF
 check "expired dir lease: Edit -> ask"           "$(fdec Edit "$RS/data/file.txt")"   ask
 check "expired dir lease: Write -> ask (Edit rule covers write tools)" "$(fdec Write "$RS/data/file.txt")" ask
 check "expired dir lease: Read -> ask"           "$(fdec Read "$RS/data/file.txt")"   ask
+check "expired dir lease: Grep -> ask"           "$(ev Grep path "$RS/data" | T hook pre | pd)"  ask
+check "expired dir lease: Glob -> ask"           "$(ev Glob path "$RS/data/sub" | T hook pre | pd)" ask
+check "expired dir lease: Grep cwd fallback -> ask" "$(evc Grep '{}' "$RS/data/sub" | T hook pre | pd)" ask
 check "expired dir lease: outside unaffected"    "$(fdec Edit "$RS/data2/file.txt")"  none
+T prune >/dev/null
+check "prune drops expired additionalDirectories entry" "$(/usr/bin/python3 -c 'import json,sys;print(sys.argv[2] not in json.load(open(sys.argv[1]))["permissions"].get("additionalDirectories",[]))' "$M" "$RS/data")" True
 # 3a. secret paths not snapshotted
 mkdir -p "$S/home/.ssh"; echo SECRETKEY > "$S/home/.ssh/config"; echo K=1 > "$S/.env"
 ev Edit file_path "$S/home/.ssh/config" | T hook pre >/dev/null
